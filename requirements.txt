@@ -1,2 +1,2 @@
 openai==2.54.0
-python-telegram-bot==22.8
+Telethon==1.45.0

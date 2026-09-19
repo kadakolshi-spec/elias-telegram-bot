@@ -6,3 +6,10 @@ tests
 *.log
 venv
 .venv
+
+*.session
+*.session-*
+*secrets*
+generate_session.py
+Generate-Session.cmd
+

@@ -8,3 +8,8 @@ __pycache__/
 *.log
 .pytest_cache/
 .DS_Store
+
+*.session
+*.session-*
+*secrets*
+

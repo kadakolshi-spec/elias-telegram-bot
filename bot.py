@@ -1,13 +1,15 @@
-"""Elias: a private-chat Telegram AI character with bounded session memory."""
+"""Elias: incoming private messages only, using a Telegram user session."""
 import asyncio
 import logging
 import os
-from collections import OrderedDict
+from collections import OrderedDict, deque
+from datetime import datetime, timezone
 from time import monotonic
 
 from openai import AsyncOpenAI
-from telegram import BotCommand, Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telethon import TelegramClient, events
+from telethon.errors import FloodWaitError
+from telethon.sessions import StringSession
 
 LOG = logging.getLogger("elias")
 PERSONA = """You are Elias, an AI character with a fictional persona of a 25-year-old
@@ -45,125 +47,166 @@ class Memory:
         self.data.pop(user_id, None)
 
 
-memory = Memory()
+
+class RateLimiter:
+    """Bounded rolling windows; denied traffic never extends or evicts quotas."""
+    def __init__(self):
+        self.users = {}
+        self.total = deque()
+        self.paused_until = 0
+
+    def allow(self, uid):
+        now = monotonic()
+        if now < self.paused_until:
+            return False
+        for key in list(self.users):
+            queue = self.users[key]
+            while queue and now - queue[0] >= 60:
+                queue.popleft()
+            if not queue:
+                del self.users[key]
+        while self.total and now - self.total[0] >= 60:
+            self.total.popleft()
+        queue = self.users.get(uid, deque())
+        if len(self.total) >= 20 or len(queue) >= 5 or (queue and now - queue[-1] < 3):
+            return False
+        queue.append(now)
+        self.users[uid] = queue
+        self.total.append(now)
+        return True
+
+    def pause(self, seconds):
+        self.paused_until = max(self.paused_until, monotonic() + seconds + 1)
 
 
-def localized(update, en, sq):
-    return sq if (update.effective_user.language_code or "").startswith("sq") else en
+class Elias:
+    def __init__(self, ai, self_id, ready_at=None):
+        self.ai, self.self_id = ai, self_id
+        self.ready_at = ready_at or datetime.now(timezone.utc)
+        self.memory = Memory()
+        self.limiter = RateLimiter()
+        self.busy = set()
+        self.seen = OrderedDict()
+
+    async def handle(self, event):
+        uid = event.sender_id
+        if (not event.is_private or event.out or not uid or uid == self.self_id
+                or uid == 777000 or not event.raw_text or event.message.date < self.ready_at):
+            return
+        key = (uid, event.id)
+        if key in self.seen or uid in self.busy or len(self.busy) >= 4:
+            return
+        if not self.limiter.allow(uid):
+            return
+        self.seen[key] = True
+        while len(self.seen) > 2000:
+            self.seen.popitem(last=False)
+        self.busy.add(uid)
+        try:
+            sender = await event.get_sender()
+            if sender is None or getattr(sender, "bot", False) or getattr(sender, "deleted", False):
+                return
+            text = event.raw_text
+            command = text.strip().split()[0].lower() if text.strip() else ""
+            sq = (getattr(sender, "lang_code", "") or "").startswith("sq")
+            if command == "/reset":
+                self.memory.reset(uid)
+                answer = "Kujtesa ime u fshi ✨" if sq else "Fresh start — my memory is cleared ✨"
+            elif command in ("/start", "/help"):
+                answer = ("Hej, jam Elias ✨ Një personazh AI. /reset fshin kujtesën; /privacy shpjegon privatësinë."
+                          if sq else "Hey, I'm Elias ✨ An AI character. /reset clears memory; /privacy explains data use.")
+            elif command == "/privacy":
+                answer = ("Teksti dhe konteksti dërgohen te OpenAI. Deri 10 shkëmbime ruhen për 24 orë në kujtesë; "
+                          "rinisja ose /reset i fshin. Logs nuk përmbajnë tekst. /reset nuk fshin mesazhet në Telegram ose të dhënat e ofruesve."
+                          if sq else "Your text and recent context go to OpenAI. Up to 10 exchanges are held in server memory for 24 hours; "
+                          "restart or /reset clears them. No message text is logged. /reset does not delete Telegram messages or provider records.")
+            elif len(text) > 4000:
+                answer = "Dërgo më pak se 4,000 karaktere." if sq else "Please send fewer than 4,000 characters."
+            elif not text.strip() or command.startswith("/"):
+                return
+            else:
+                history = self.memory.history(uid) + [{"role": "user", "content": text}]
+                response = await self.ai.responses.create(
+                    model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"), instructions=PERSONA,
+                    input=history, max_output_tokens=300, store=False)
+                answer = response.output_text.strip()[:1800]
+                if not answer:
+                    raise ValueError("Empty response")
+                if monotonic() < self.limiter.paused_until:
+                    return
+                await event.reply(answer, parse_mode=None, link_preview=False)
+                self.memory.save(uid, history + [{"role": "assistant", "content": answer}])
+                LOG.info("Private message reply sent")
+                return
+            if monotonic() >= self.limiter.paused_until:
+                await event.reply(answer, parse_mode=None, link_preview=False)
+        except FloodWaitError as exc:
+            self.limiter.pause(exc.seconds)
+            LOG.warning("Telegram requested a cooldown; outgoing replies paused")
+        except Exception as exc:
+            # Never include exception text, IDs, message bodies or credentials.
+            LOG.warning("Reply failed (%s)", type(exc).__name__)
+        finally:
+            self.busy.discard(uid)
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(localized(update,
-        "Hey, I'm Elias ✨ An AI character with a playful side. What's on your mind?\n"
-        "Text only • /reset clears my session memory • /privacy explains data use.",
-        "Hej, jam Elias ✨ Një personazh AI me pak humor. Çfarë ke në mendje?\n"
-        "Vetëm tekst • /reset fshin kujtesën time • /privacy shpjegon privatësinë."))
+def configuration():
+    names = ("TELEGRAM_API_ID", "TELEGRAM_API_HASH", "TELEGRAM_SESSION", "OPENAI_API_KEY")
+    values = {}
+    for name in names:
+        value = os.getenv(name, "").strip()
+        if not value:
+            raise ValueError("Missing required environment variable: " + name)
+        values[name] = value
+    values["TELEGRAM_API_ID"] = int(values["TELEGRAM_API_ID"])
+    if values["TELEGRAM_API_ID"] <= 0:
+        raise ValueError("Invalid TELEGRAM_API_ID")
+    return values
 
 
-async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    memory.reset(update.effective_user.id)
-    await update.message.reply_text(localized(update, "Fresh start — my memory is cleared ✨",
-                                              "Fillim i ri — kujtesa ime u fshi ✨"))
-
-
-async def privacy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(localized(update,
-        "Your text and recent chat context are sent to OpenAI to generate replies. "
-        "I keep up to 10 exchanges per user in temporary server memory for up to 24 hours; "
-        "restarts and /reset erase them. No chat text is logged. /reset does not delete "
-        "Telegram messages or provider records. Please don't send secrets.",
-        "Teksti dhe konteksti i fundit dërgohen te OpenAI për përgjigje. Ruaj deri në "
-        "10 shkëmbime për përdorues në kujtesën e përkohshme të serverit deri 24 orë; "
-        "rinisja dhe /reset i fshijnë. Teksti nuk ruhet në logs. /reset nuk fshin "
-        "mesazhet në Telegram ose të dhënat e ofruesve. Mos dërgo sekrete."))
-
-
-async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    message = update.message
-    if len(message.text) > 4000:
-        await message.reply_text(localized(update, "Send a shorter message, please (under 4,000 characters).",
-                                            "Dërgo një mesazh më të shkurtër (nën 4,000 karaktere)."))
-        return
-    history = memory.history(update.effective_user.id)
-    history.append({"role": "user", "content": message.text})
+async def run():
+    config = configuration()
+    client = TelegramClient(StringSession(config["TELEGRAM_SESSION"]),
+                            config["TELEGRAM_API_ID"], config["TELEGRAM_API_HASH"],
+                            catch_up=False, flood_sleep_threshold=0,
+                            request_retries=0, connection_retries=5,
+                            device_model="Elias Railway")
+    ai = AsyncOpenAI(api_key=config["OPENAI_API_KEY"], timeout=30.0, max_retries=1)
     try:
-        response = await context.bot_data["openai"].responses.create(
-            model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-            instructions=PERSONA, input=history, max_output_tokens=300, store=False,
-        )
-        answer = response.output_text.strip()
-        if not answer:
-            raise ValueError("Empty model response")
-        # Unicode-safe conservative limit for Telegram's UTF-16 message length.
-        answer = answer[:1800]
-        await message.reply_text(answer)
-        history.append({"role": "assistant", "content": answer})
-        memory.save(update.effective_user.id, history)
-    except Exception as exc:
-        # Never log exception text: URLs/errors may contain tokens or user text.
-        LOG.warning("Reply failed (%s)", type(exc).__name__)
-        await message.reply_text(localized(update, "A little connection hiccup — please try again shortly.",
-                                            "Pata një problem lidhjeje — provo përsëri pas pak."))
-
-
-async def unsupported(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(localized(update, "Send me text for now 🙂 /help shows the commands.",
-                                              "Për momentin më dërgo tekst 🙂 /help tregon komandat."))
-
-
-async def on_error(update, context):
-    LOG.warning("Telegram update failed (%s)", type(context.error).__name__)
-
-
-async def startup(app):
-    client = AsyncOpenAI(timeout=30.0, max_retries=2)
-    app.bot_data["openai"] = client
-    # Verify credentials/model with a tiny request before declaring readiness.
-    try:
-        result = await client.responses.create(model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
-                                               input="Reply OK", max_output_tokens=16, store=False)
+        # Never call start(): a deployed worker must never request interactive login.
+        await client.connect()
+        if not await client.is_user_authorized():
+            raise ValueError("Regenerate TELEGRAM_SESSION locally")
+        me = await client.get_me()
+        if me is None or me.bot:
+            raise ValueError("A normal user account session is required")
+        result = await ai.responses.create(model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+                                          input="Reply OK", max_output_tokens=16, store=False)
         if not result.output_text.strip():
-            raise ValueError("Empty startup response")
-        await app.bot.set_my_commands([BotCommand("start", "Meet Elias"),
-            BotCommand("reset", "Clear conversation memory"), BotCommand("privacy", "Data and privacy"),
-            BotCommand("help", "Show help")])
-        LOG.info("Startup verified: Telegram authenticated and OpenAI response OK; starting polling")
-    except Exception:
-        await client.close()
-        raise
-
-
-async def shutdown(app):
-    await app.bot_data["openai"].close()
-
-
-def build_app():
-    for name in ("TELEGRAM_BOT_TOKEN", "OPENAI_API_KEY"):
-        if not os.getenv(name, "").strip():
-            raise ValueError(f"Missing required environment variable: {name}")
-    app = (Application.builder().token(os.environ["TELEGRAM_BOT_TOKEN"])
-           .concurrent_updates(False).post_init(startup).post_shutdown(shutdown).build())
-    private = filters.ChatType.PRIVATE
-    for command, callback in (("start", start), ("help", start), ("reset", reset), ("privacy", privacy)):
-        app.add_handler(CommandHandler(command, callback, filters=private))
-    app.add_handler(MessageHandler(private & filters.TEXT & ~filters.COMMAND, chat))
-    app.add_handler(MessageHandler(private & filters.ALL, unsupported))
-    app.add_error_handler(on_error)
-    return app
+            raise ValueError("OpenAI startup check failed")
+        # Telegram timestamps have second precision. Skip this partial second too.
+        ready = datetime.now(timezone.utc)
+        elias = Elias(ai, me.id, ready)
+        client.add_event_handler(elias.handle, events.NewMessage(incoming=True))
+        LOG.info("Startup verified: Telegram user authenticated; OpenAI OK; private replies ready")
+        await client.run_until_disconnected()
+    finally:
+        await client.disconnect()
+        await ai.close()
 
 
 def main():
-    logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(level=logging.CRITICAL,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     LOG.setLevel(logging.INFO)
-    # Silence HTTP logs so Telegram token URLs cannot appear in deployment logs.
-    for name in ("httpx", "httpcore", "openai", "telegram"):
+    for name in ("telethon", "httpx", "httpcore", "openai", "asyncio"):
         logging.getLogger(name).setLevel(logging.CRITICAL)
-    asyncio.set_event_loop(asyncio.new_event_loop())
     try:
-        build_app().run_polling(allowed_updates=["message"], drop_pending_updates=False,
-                                bootstrap_retries=0)
+        asyncio.run(run())
+    except KeyboardInterrupt:
+        pass
     except Exception as exc:
-        LOG.error("Startup/process failed (%s). Check credentials, billing and connectivity.", type(exc).__name__)
+        LOG.error("Startup/process failed (%s). Check required environment, credentials and billing.", type(exc).__name__)
         raise SystemExit(1) from None
 
 
