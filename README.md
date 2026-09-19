@@ -26,8 +26,10 @@ Optional: `OPENAI_MODEL` (default `gpt-4.1-mini`). `.env.example` is a template 
 production reads environment variables and does not load local `.env` files.
 `TELEGRAM_BOT_TOKEN` is obsolete and can be removed after successful migration.
 
-Use the Dockerfile and `railway.toml`, one replica, no public HTTP domain or HTTP
-healthcheck. Stop the old deployment before starting the user-session worker to
+Use the auto-detected Dockerfile, one replica, Serverless disabled, no public HTTP
+domain or HTTP healthcheck. Set Restart Policy to On Failure with 3 retries in the
+Railway dashboard. `railway.toml` is a legacy reference only: this newly created
+service cannot opt into deprecated Config as Code, so dashboard settings apply. Stop the old deployment before starting the user-session worker to
 avoid overlap. Session must belong to a normal user account, not a bot. The worker
 checks Telegram authorization and an OpenAI response before logging readiness.
 

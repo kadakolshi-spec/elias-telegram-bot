@@ -1,3 +1,5 @@
+# Legacy reference only. New Railway services ignore Config as Code.
+# Configure one replica and On Failure / 3 retries in the dashboard.
 [build]
 builder = "DOCKERFILE"
 
